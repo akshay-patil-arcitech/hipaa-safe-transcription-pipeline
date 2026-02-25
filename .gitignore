@@ -1,0 +1,30 @@
+﻿# Virtual environments
+venv/
+whisperx_venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Env files
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs / data artifacts
+JSON FILES/
+*.wav
+*_transcribes.json
+*_transcripts.json
+*_whisperx_transcripts.json
+*_transcribes_word_ts.json
+
+# OS files
+.DS_Store
+Thumbs.db

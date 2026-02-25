@@ -1,0 +1,4 @@
+openai whisper tiny(39M/75) : 2:30 - 75-80% accuracy
+openai whisper base(74M/142) : 4:00 - 80-85% accuracy 
+openai whisper small(244M/466) : 13-15 min - 80-85% accuracy
+openai whisper medium(769M/1.5) : 30-35 mins - 92-95% accuracy
