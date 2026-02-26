@@ -216,14 +216,12 @@ def _resolve_device(device: str | None) -> str:
 def _format_ts(seconds: float) -> str:
     if seconds < 0:
         seconds = 0
-    total_ms = int(round(seconds * 1000))
-    ms = total_ms % 1000
-    total_seconds = total_ms // 1000
+    total_seconds = int(round(seconds))
     s = total_seconds % 60
     total_minutes = total_seconds // 60
     m = total_minutes % 60
     h = total_minutes // 60
-    return f"{h}:{m:02d}:{s:02d}.{ms:03d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _speaker_label(tag: int, roles: list[str] | None) -> str:
@@ -294,12 +292,13 @@ def postprocess_segments(segments: list[SegmentLike], merge_gap: float, min_seg:
 def reassign_minor_speakers(
     segments: list[SegmentLike],
     max_speakers: int | None,
+    min_speakers: int | None,
     min_total_sec: float | None,
     merge_gap: float,
 ) -> list[SegmentLike]:
     if not segments:
         return []
-    if max_speakers is None and (min_total_sec is None or min_total_sec <= 0):
+    if max_speakers is None and (min_total_sec is None or min_total_sec <= 0) and (min_speakers is None or min_speakers <= 0):
         return segments
     totals: dict[int, float] = {}
     for seg in segments:
@@ -312,6 +311,12 @@ def reassign_minor_speakers(
         for tag, total in totals.items():
             if total >= min_total_sec:
                 keep.add(tag)
+    if min_speakers is not None and min_speakers > 0:
+        ranked = [tag for tag, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)]
+        for tag in ranked:
+            if len(keep) >= min_speakers:
+                break
+            keep.add(tag)
     if not keep:
         return segments
     sorted_segments = sorted(segments, key=lambda s: (s.start_sec, s.end_sec))
@@ -653,6 +658,14 @@ def run(
     masking: bool = True,
     masking_entities: list[str] | None = None,
     sentiment: bool = True,
+    include_word_ts: bool = True,
+    max_speakers: int | None = None,
+    min_speakers: int | None = None,
+    min_speaker_sec: float | None = None,
+    diar_merge_gap: float = 0.4,
+    diar_min_seg: float = 0.6,
+    diar_collapse_short: bool = True,
+    force_roles: bool = False,
     beep_audio: bool = False,
     beep_freq_hz: float = 1000.0,
     beep_gain: float = 0.4,
@@ -674,13 +687,28 @@ def run(
     with prepared_audio(media_path) as audio_path:
         raw_segments = diarizer.process_file(audio_path)
         segments = [SegmentLike(s.start_sec, s.end_sec, s.speaker_tag) for s in raw_segments]
-        segments = postprocess_segments(segments, merge_gap=0.4, min_seg=0.6, collapse_short=True)
-        segments = reassign_minor_speakers(segments, max_speakers=3 if speaker_roles else None, min_total_sec=None, merge_gap=0.4)
-        segments = _merge_adjacent_same_speaker(segments, merge_gap=0.4)
+        if max_speakers is not None and min_speakers is not None and max_speakers < min_speakers:
+            raise ValueError("max_speakers must be >= min_speakers.")
+        if force_roles and speaker_roles:
+            if max_speakers is None:
+                max_speakers = len(speaker_roles)
+            if min_speakers is None:
+                min_speakers = len(speaker_roles)
+
+        segments = postprocess_segments(segments, merge_gap=diar_merge_gap, min_seg=diar_min_seg, collapse_short=diar_collapse_short)
+        segments = reassign_minor_speakers(
+            segments,
+            max_speakers=max_speakers if max_speakers and max_speakers > 0 else None,
+            min_speakers=min_speakers if min_speakers and min_speakers > 0 else None,
+            min_total_sec=min_speaker_sec,
+            merge_gap=diar_merge_gap,
+        )
+        segments = _merge_adjacent_same_speaker(segments, merge_gap=diar_merge_gap)
         if speaker_roles:
             segments = apply_speaker_roles(segments, speaker_roles)
 
         transcriptions = []
+        need_word_ts = include_word_ts or beep_audio
         audio_f32, sample_rate = _load_wave_as_float32(audio_path)
 
         for segment in segments:
@@ -696,14 +724,17 @@ def run(
                 entities = _parse_masking_entities(masking_entities)
                 text = _mask_text(text, entities, lang)
             sentiment_label = _predict_sentiment(text, device) if sentiment else None
-            words = _align_words_for_segment(text, lang, segment_audio, segment.start_sec, device, align_cache)
+            words = []
+            if need_word_ts:
+                words = _align_words_for_segment(text, lang, segment_audio, segment.start_sec, device, align_cache)
             item = {
                 "speaker": _speaker_label(segment.speaker_tag, speaker_roles),
                 "transcribe": text,
                 "start_ts": _format_ts(segment.start_sec),
                 "end_ts": _format_ts(segment.end_sec),
-                "words": words,
             }
+            if need_word_ts:
+                item["words"] = words
             if sentiment_label is not None:
                 item["sentiment"] = sentiment_label
             transcriptions.append(item)
@@ -717,10 +748,19 @@ def run(
 
     diarizer.delete()
 
-    with open(output_path, "w", encoding="utf-8") as file:
-        json.dump(transcriptions, file, ensure_ascii=False, indent=2)
+    output_segments = transcriptions
+    if not include_word_ts:
+        output_segments = []
+        for seg in transcriptions:
+            if "words" in seg:
+                seg = dict(seg)
+                seg.pop("words", None)
+            output_segments.append(seg)
 
-    result = {"segments": transcriptions, "output_file": output_path.name}
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(output_segments, file, ensure_ascii=False, indent=2)
+
+    result = {"segments": output_segments, "output_file": output_path.name}
     if beeped_path:
         result["beeped_audio_file"] = beeped_path.name
     return result
@@ -742,6 +782,13 @@ if __name__ == "__main__":
     parser.add_argument("--beep-audio", action="store_true")
     parser.add_argument("--beep-freq-hz", type=float, default=1000.0)
     parser.add_argument("--beep-gain", type=float, default=0.4)
+    parser.add_argument("--max-speakers", type=int, default=None)
+    parser.add_argument("--min-speakers", type=int, default=None)
+    parser.add_argument("--min-speaker-sec", type=float, default=None)
+    parser.add_argument("--diar-merge-gap", type=float, default=0.4)
+    parser.add_argument("--diar-min-seg", type=float, default=0.6)
+    parser.add_argument("--no-diar-collapse-short", action="store_true")
+    parser.add_argument("--force-roles", action="store_true")
     args = parser.parse_args()
 
     roles = [r.strip() for r in args.speaker_roles.split(",") if r.strip()]
@@ -757,6 +804,13 @@ if __name__ == "__main__":
         beep_audio=args.beep_audio,
         beep_freq_hz=args.beep_freq_hz,
         beep_gain=args.beep_gain,
+        max_speakers=args.max_speakers,
+        min_speakers=args.min_speakers,
+        min_speaker_sec=args.min_speaker_sec,
+        diar_merge_gap=args.diar_merge_gap,
+        diar_min_seg=args.diar_min_seg,
+        diar_collapse_short=not args.no_diar_collapse_short,
+        force_roles=args.force_roles,
     )
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
@@ -786,6 +840,14 @@ async def transcribe_word_ts_api(
     masking: bool = Form(default=True),
     masking_entities: str | None = Form(default="PHI"),
     sentiment: bool = Form(default=True),
+    word_to_word: bool = Form(default=True),
+    max_speakers: int | None = Form(default=None),
+    min_speakers: int | None = Form(default=None),
+    min_speaker_sec: float | None = Form(default=None),
+    diar_merge_gap: float = Form(default=0.4),
+    diar_min_seg: float = Form(default=0.6),
+    diar_collapse_short: bool = Form(default=True),
+    force_roles: bool = Form(default=False),
     beep_audio: bool = Form(default=False),
     beep_freq_hz: float = Form(default=1000.0),
     beep_gain: float = Form(default=0.4),
@@ -817,6 +879,14 @@ async def transcribe_word_ts_api(
             masking=masking,
             masking_entities=entities,
             sentiment=sentiment,
+            include_word_ts=word_to_word,
+            max_speakers=max_speakers,
+            min_speakers=min_speakers,
+            min_speaker_sec=min_speaker_sec,
+            diar_merge_gap=diar_merge_gap,
+            diar_min_seg=diar_min_seg,
+            diar_collapse_short=diar_collapse_short,
+            force_roles=force_roles,
             beep_audio=beep_audio,
             beep_freq_hz=beep_freq_hz,
             beep_gain=beep_gain,
